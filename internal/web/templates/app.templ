@@ -1,0 +1,456 @@
+package templates
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/geral/local-assistant-laya/internal/store"
+)
+
+// Health is the small status strip above the input.
+type Health struct {
+	Tier        string
+	Threshold   float64
+	SchedulerUp bool
+	StoreUp     bool
+	SSEClients  int
+}
+
+func humanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm %02ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh %02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+func kindBadge(kind string) string {
+	if kind == store.KindTimer {
+		return "Timer"
+	}
+	return "Reminder"
+}
+
+// Times are stored as absolute instants in UTC. They must be rendered in the
+// user's own zone, or "3 PM" comes back as "20:00 UTC" and looks like a bug.
+func fmtStamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format("Mon 2 Jan 15:04:05 MST")
+}
+
+func fmtShort(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format("Mon 2 Jan 15:04")
+}
+
+func displayLabel(t store.Task) string {
+	if t.Label != "" {
+		return t.Label
+	}
+	// A bare "20 min" leaves nothing behind once the time expression is
+	// consumed. Echoing the raw input beats repeating the kind badge.
+	return t.RawInput
+}
+
+func confidenceColor(c float64) string {
+	switch {
+	case c >= 0.9:
+		return "text-emerald-400"
+	case c >= 0.85:
+		return "text-sky-400"
+	default:
+		return "text-amber-400"
+	}
+}
+
+func confidenceText(c float64) string {
+	return fmt.Sprintf("%.0f%%", c*100)
+}
+
+const htmxConfig = `{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}`
+
+// localInput formats a due time for a datetime-local input in the zone the
+// UI renders in.
+func localInput(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format("2006-01-02T15:04")
+}
+
+func taskTarget(id int64) string { return fmt.Sprintf("#task-%d", id) }
+
+func taskURL(id int64, suffix string) string { return fmt.Sprintf("/tasks/%d%s", id, suffix) }
+
+templ Layout(pending []store.Task, missed []store.Task, health Health) {
+	<!DOCTYPE html>
+	<html lang="en" class="h-full">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<meta name="color-scheme" content="dark"/>
+			<title>Local Assistant</title>
+			// htmx 2 discards 4xx/5xx bodies by default, which would hide every
+			// rejection message. Swap them; the server retargets them to #notice.
+			<meta name="htmx-config" content={ htmxConfig }/>
+			<link rel="stylesheet" href="/static/tailwind.css"/>
+			<script src="/static/vendor/htmx.min.js"></script>
+			<script src="/static/vendor/alpine.min.js" defer></script>
+			<script>
+				// Countdown formatting lives on window so Alpine expressions
+				// stay short. Defined before Alpine initialises.
+				window.laClock = function (seconds) {
+					seconds = Math.max(0, seconds);
+					var h = Math.floor(seconds / 3600);
+					var m = Math.floor((seconds % 3600) / 60);
+					var s = seconds % 60;
+					var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+					if (h > 0) { return h + "h " + pad(m) + "m"; }
+					if (m > 0) { return m + "m " + pad(s) + "s"; }
+					return s + "s";
+				};
+				window.laCountdown = function (seconds) {
+					return {
+						r: seconds,
+						start: function () {
+							var self = this;
+							var id = setInterval(function () {
+								if (self.r > 0) { self.r--; } else { clearInterval(id); }
+							}, 1000);
+						}
+					};
+				};
+			</script>
+		</head>
+		<body class="min-h-full bg-slate-950 text-slate-100 antialiased">
+			<main class="mx-auto w-full max-w-3xl px-4 py-10">
+				<header class="mb-8 flex flex-wrap items-baseline justify-between gap-2">
+					<h1 class="text-2xl font-semibold tracking-tight">Local Assistant</h1>
+					<p class="text-xs text-slate-500">
+						tier { health.Tier} · confirm at { fmt.Sprintf("%.2f", health.Threshold) } · { health.SSEClients} live
+					</p>
+				</header>
+				@inputBox()
+				<div id="notice" class="mt-3" role="status" aria-live="polite"></div>
+				<div id="timeline" class="mt-8 space-y-6">
+					@Timeline(pending, missed)
+				</div>
+			</main>
+			<div id="toasts" class="pointer-events-none fixed bottom-4 right-4 z-50 space-y-2"></div>
+			@alertScript()
+		</body>
+	</html>
+}
+
+templ inputBox() {
+	<form
+		hx-post="/parse"
+		hx-target="#timeline"
+		hx-swap="innerHTML"
+		hx-on::before-request="document.getElementById('notice').innerHTML = ''"
+		hx-on::after-request="if(event.detail.successful && !event.detail.xhr.getResponseHeader('HX-Retarget')) this.reset()"
+		class="flex gap-2"
+		>
+		<input
+			type="text"
+			name="q"
+			autofocus
+			autocomplete="off"
+			spellcheck="false"
+			placeholder="count 20 min  ·  remind me at 3 PM to email the invoice"
+			class="w-full rounded-lg border border-slate-800 bg-slate-900 px-4 py-3 text-slate-100 placeholder-slate-600 focus:border-sky-500 focus:outline-none"
+			/>
+		<button
+			type="submit"
+			class="shrink-0 rounded-lg bg-sky-600 px-5 py-3 font-medium text-white hover:bg-sky-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+			>
+			Set
+		</button>
+	</form>
+}
+
+templ Timeline(pending []store.Task, missed []store.Task) {
+	if len(missed) > 0 {
+		@missedBanner(missed)
+	}
+	if len(pending) == 0 {
+		<p class="rounded-lg border border-dashed border-slate-800 px-4 py-8 text-center text-sm text-slate-600">
+			Nothing scheduled. Try <span class="text-slate-400">count 20 min</span>.
+		</p>
+	} else {
+		<section class="space-y-3">
+			<h2 class="text-xs font-medium uppercase tracking-wider text-slate-500">Upcoming</h2>
+			for _, t := range pending {
+				@TaskRow(t)
+			}
+		</section>
+	}
+}
+
+templ missedBanner(missed []store.Task) {
+	<div class="rounded-lg border border-amber-800/60 bg-amber-950/30 px-4 py-3">
+		<p class="text-sm font-medium text-amber-300">
+			{ fmt.Sprintf("%d task(s) came due while the app was not running", len(missed)) }
+		</p>
+		<ul class="mt-2 space-y-1 text-xs text-amber-200/70">
+			for _, t := range missed {
+				<li>
+					{ displayLabel(t) }
+					<span class="text-amber-200/40">· { fmtShort(t.DueAt) }</span>
+				</li>
+			}
+		</ul>
+	</div>
+}
+
+templ TaskRow(t store.Task) {
+	<div
+		id={ fmt.Sprintf("task-%d", t.ID) }
+		class={ rowClass(t) }
+		x-data="{ editing: false }"
+		>
+		if t.NeedsConfirm {
+			@confirmBanner(t)
+		}
+		if t.RolledOver {
+			<p class="mb-3 rounded border border-sky-900/60 bg-sky-950/20 px-3 py-1.5 text-xs text-sky-300">
+				That time had already passed today, so this moved to the next day.
+			</p>
+		}
+		<div class="flex flex-wrap items-center justify-between gap-3">
+			<div class="min-w-0 flex-1">
+				<div class="flex items-center gap-2">
+					<span class="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+						{ kindBadge(t.Kind) }
+					</span>
+					<span class="truncate font-medium">{ displayLabel(t) }</span>
+				</div>
+				<p class="mt-1 text-xs text-slate-500">
+					{ fmtStamp(t.DueAt) }
+					<span class="text-slate-600">· parsed by { t.SourceTier } at <span class={ confidenceColor(t.Confidence) }>{ confidenceText(t.Confidence) }</span></span>
+				</p>
+			</div>
+			@Countdown(t)
+			@actions(t)
+		</div>
+		@editForm(t)
+	</div>
+}
+
+// editForm is the one-click correction path from US-004. Editing is the
+// ground truth the calibration log learns from.
+templ editForm(t store.Task) {
+	<form
+		x-show="editing"
+		style="display: none"
+		hx-post={ taskURL(t.ID, "") }
+		hx-target={ taskTarget(t.ID) }
+		hx-swap="outerHTML"
+		class="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-800 pt-3"
+		>
+		<label class="flex min-w-0 flex-1 flex-col gap-1 text-xs text-slate-500">
+			Label
+			<input
+				type="text"
+				name="label"
+				value={ t.Label }
+				maxlength="500"
+				class="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+			/>
+		</label>
+		<label class="flex flex-col gap-1 text-xs text-slate-500">
+			When
+			<input
+				type="datetime-local"
+				name="due"
+				value={ localInput(t.DueAt) }
+				class="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+			/>
+		</label>
+		<button type="submit" class="rounded bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500">
+			Save
+		</button>
+		<button type="button" x-on:click="editing = false" class="rounded border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800">
+			Cancel
+		</button>
+	</form>
+}
+
+var snoozeSteps = []int{5, 15, 60}
+
+func rowClass(t store.Task) string {
+	if t.NeedsConfirm {
+		return "rounded-lg border border-amber-700/60 bg-amber-950/20 px-4 py-3"
+	}
+	return "rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3"
+}
+
+templ confirmBanner(t store.Task) {
+	<div class="mb-3 rounded border border-amber-800/60 bg-amber-950/30 px-3 py-2">
+		<p class="text-xs text-amber-200">
+			<strong class="font-medium">Not sure about this one.</strong>
+			{ " " + t.Rationale }
+		</p>
+		<div class="mt-2 flex gap-2">
+			<button
+				hx-post={ fmt.Sprintf("/tasks/%d/confirm", t.ID) }
+				hx-target={ fmt.Sprintf("#task-%d", t.ID) }
+				hx-swap="outerHTML"
+				class="rounded bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-500"
+				>
+				Yes, that's right
+			</button>
+			<button
+				hx-post={ fmt.Sprintf("/tasks/%d/cancel", t.ID) }
+				hx-target={ fmt.Sprintf("#task-%d", t.ID) }
+				hx-swap="outerHTML"
+				class="rounded border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800"
+				>
+				Discard
+			</button>
+		</div>
+	</div>
+}
+
+templ Countdown(t store.Task) {
+	// The ticking JS lives on window. A JavaScript brace inside a templ
+	// attribute expression would be read as the start of a Go expression.
+	<div
+		x-data={ fmt.Sprintf("window.laCountdown(%d)", int(time.Until(t.DueAt).Seconds())) }
+		x-init="start()"
+		class="font-mono text-sm tabular-nums text-sky-300"
+		>
+		<span x-text="window.laClock(r)">{ humanDuration(time.Until(t.DueAt)) }</span>
+	</div>
+}
+
+templ actions(t store.Task) {
+	<div class="flex flex-wrap gap-1">
+		<button
+			hx-post={ fmt.Sprintf("/tasks/%d/done", t.ID) }
+			hx-target={ fmt.Sprintf("#task-%d", t.ID) }
+			hx-swap="outerHTML"
+			class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+			title="Mark done"
+			>
+			Done
+		</button>
+		for _, m := range snoozeSteps {
+			<button
+				hx-post={ taskURL(t.ID, fmt.Sprintf("/snooze?minutes=%d", m)) }
+				hx-target={ taskTarget(t.ID) }
+				hx-swap="outerHTML"
+				class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+				title={ fmt.Sprintf("Push back %d minutes", m) }
+				>
+				{ fmt.Sprintf("+%dm", m) }
+			</button>
+		}
+		<button
+			type="button"
+			x-on:click="editing = !editing"
+			class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+			title="Edit label or time"
+			>
+			Edit
+		</button>
+		// Deleting is destructive (PRD section 14), so it asks first.
+		<button
+			hx-post={ taskURL(t.ID, "/cancel") }
+			hx-target={ taskTarget(t.ID) }
+			hx-swap="outerHTML"
+			hx-confirm="Delete this task?"
+			class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-400 hover:bg-slate-800"
+			title="Delete"
+			aria-label="Delete"
+			>
+			✕
+		</button>
+	</div>
+}
+
+templ alertScript() {
+	<script>
+		// Renders an in-page alert when the scheduler pushes a fired event.
+		function laToast(title, body) {
+			var host = document.getElementById("toasts");
+			var el = document.createElement("div");
+			el.className = "pointer-events-auto rounded-lg border border-sky-700 bg-slate-900 px-4 py-3 shadow-lg";
+			el.innerHTML = "";
+			var h = document.createElement("p");
+			h.className = "text-sm font-semibold text-sky-300";
+			h.textContent = title;
+			el.appendChild(h);
+			if (body) {
+				var b = document.createElement("p");
+				b.className = "mt-1 whitespace-pre-line text-xs text-slate-400";
+				b.textContent = body;
+				el.appendChild(b);
+			}
+			host.appendChild(el);
+			setTimeout(function () { el.remove(); }, 20000);
+		}
+
+		// A short WebAudio chime, so an alert with the tab in the background
+		// is still audible without shipping an audio file.
+		function laChime() {
+			try {
+				var ctx = new (window.AudioContext || window.webkitAudioContext)();
+				var osc = ctx.createOscillator();
+				var gain = ctx.createGain();
+				osc.connect(gain);
+				gain.connect(ctx.destination);
+				osc.type = "sine";
+				osc.frequency.value = 880;
+				gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+				gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+				gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.9);
+				osc.start();
+				osc.stop(ctx.currentTime + 0.95);
+			} catch (e) { /* audio is a nicety, never a failure path */ }
+		}
+
+		// Native EventSource rather than the htmx SSE extension: one less
+		// vendored file, and EventSource reconnects on its own.
+		(function () {
+			if (!("EventSource" in window)) { return; }
+			var es = new EventSource("/events");
+			es.addEventListener("fired", function (e) {
+				var d;
+				try { d = JSON.parse(e.data); } catch (err) { return; }
+				laToast(d.title, d.body);
+				laChime();
+				if ("Notification" in window && Notification.permission === "granted") {
+					new Notification(d.title, { body: d.body });
+				}
+			});
+			es.addEventListener("refresh", function () {
+				// Do not yank an open edit form out from under the user.
+				if (document.querySelector("#timeline form:not([style*='display: none'])")) { return; }
+				htmx.ajax("GET", "/timeline", { target: "#timeline", swap: "innerHTML" });
+			});
+		})();
+	</script>
+}
+
+templ ErrorFragment(msg string) {
+	<div class="rounded-lg border border-rose-800 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+		{ msg }
+	</div>
+}
+
+templ DoneFragment(label string) {
+	<div class="rounded-lg border border-slate-800 px-4 py-3 text-sm text-slate-500">
+		{ "Done: " + label }
+	</div>
+}

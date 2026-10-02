@@ -1,0 +1,46 @@
+# Build output
+/local-assistant
+*.exe
+*.exe~
+/dist/
+/bin/
+
+# Downloaded build tools (40 MB Tailwind standalone CLI). Pin the version in
+# docs instead of committing the binary.
+/tools/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Local data: SQLite database, WAL/SHM sidecars, VAPID keys
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.pem
+vapid*.json
+
+# Go test and profiling artifacts
+*.test
+*.out
+coverage.*
+*.prof
+
+# Scratch
+*.tmp
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Kept on purpose (do not add here):
+#   internal/web/templates/*_templ.go  generated, so `go build` needs no templ
+#   internal/web/static/tailwind.css   generated, so runtime needs no Node or CLI
